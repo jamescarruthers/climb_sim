@@ -646,7 +646,7 @@ export class Climber {
     // body-local diag, which is acceptable for stabilisation purposes.
     const Iavg = (pelvis.inertiaLocal[0] + pelvis.inertiaLocal[1] + pelvis.inertiaLocal[2]) / 3;
     // Tuned: 200 keeps the pelvis upright without the strong reaction torques
-    // that 1000+ generates (the latter destabilises arm reaches by whipping
+    // that 600+ generates (the latter destabilises arm reaches by whipping
     // the body when the IK pose-targets shift the shoulder).
     const kp = 200;
     const kd = 2 * Math.sqrt(kp * Iavg);
