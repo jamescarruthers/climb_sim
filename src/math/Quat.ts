@@ -142,6 +142,36 @@ export class Quat {
   toArray(): [number, number, number, number] { return [this.x, this.y, this.z, this.w]; }
 }
 
+/**
+ * Spherical linear interpolation between two unit quaternions.
+ * t = 0 → a, t = 1 → b. Picks the shortest arc.
+ */
+export function slerp(a: Quat, b: Quat, t: number): Quat {
+  let bx = b.x, by = b.y, bz = b.z, bw = b.w;
+  let dot = a.x * bx + a.y * by + a.z * bz + a.w * bw;
+  if (dot < 0) { bx = -bx; by = -by; bz = -bz; bw = -bw; dot = -dot; }
+  if (dot > 0.9995) {
+    return new Quat(
+      a.x + (bx - a.x) * t,
+      a.y + (by - a.y) * t,
+      a.z + (bz - a.z) * t,
+      a.w + (bw - a.w) * t,
+    ).normalize();
+  }
+  const theta0 = Math.acos(Math.min(1, Math.max(-1, dot)));
+  const theta = theta0 * t;
+  const sinTheta = Math.sin(theta);
+  const sinTheta0 = Math.sin(theta0);
+  const s0 = Math.cos(theta) - dot * sinTheta / sinTheta0;
+  const s1 = sinTheta / sinTheta0;
+  return new Quat(
+    a.x * s0 + bx * s1,
+    a.y * s0 + by * s1,
+    a.z * s0 + bz * s1,
+    a.w * s0 + bw * s1,
+  ).normalize();
+}
+
 /** Shortest-arc quaternion rotating `from` to `to` (unit-ish vectors). */
 export function quatFromTo(from: Vec3, to: Vec3): Quat {
   const a = from.clone().normalize();
