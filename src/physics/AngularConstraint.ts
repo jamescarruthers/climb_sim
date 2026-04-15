@@ -8,16 +8,19 @@ import { stablePDTorque } from '../control/SPD';
  *
  *   1. applyAngularLimits — hard limit cone + twist range. Only fires when
  *      the joint is outside its envelope (relative to the FIXED rest pose).
- *      Damping is applied unconditionally so unconstrained joints don't
- *      spin freely.
  *
  *   2. applyPoseTracking — soft pose tracking. Drives the joint toward an
  *      independently-set pose target via SPD, regardless of where the limit
  *      envelope is. The IK solver and the body-lean controller write into
  *      poseTargets without affecting the limit envelope.
  *
- * Both use per-axis Stable PD with inertia-weighted gains so distal segments
- * stay stable.
+ * Damping is computed per-axis from the actual segment inertia
+ * (kd_axis = 2·dampingRatio·sqrt(kp · I_axis)) so a hand and a thorax —
+ * which differ by 100×+ in inertia — both end up critically damped at the
+ * same kp setting. Without this, a single fixed kd over-damps small
+ * segments by the same factor and the controller produces almost no torque
+ * at all. (Symptom: arms hang limp during a reach because the shoulder /
+ * elbow tracking is effectively dead at the gains needed for the trunk.)
  */
 
 export interface AngularLimits {
@@ -34,13 +37,18 @@ const MAX_LIMB_TORQUE = 300;     // Nm — cap to bound transients
 const MAX_TRACK_TORQUE = 250;    // Nm — pose tracking, big enough to support
                                  //       body weight through the legs.
 
+/** kd for critical damping at gain `kp` on a body with effective inertia `I`. */
+function criticalKd(kp: number, I: number, ratio: number): number {
+  return 2 * ratio * Math.sqrt(Math.max(1e-6, kp * I));
+}
+
 export function applyAngularLimits(
   parent: RigidBody,
   child: RigidBody,
   restRelative: Quat,
   limits: AngularLimits,
   kp: number,
-  kd: number,
+  dampingRatio: number,
   dt: number,
 ): void {
   const err = relativeError(parent, child, restRelative);
@@ -63,10 +71,13 @@ export function applyAngularLimits(
 
   const relOmega = relativeAngularVelocity(parent, child);
   const I = effectiveInertiaParentFrame(child, computeRelative(parent, child));
+  const kdX = criticalKd(kp, I[0], dampingRatio);
+  const kdY = criticalKd(kp, I[1], dampingRatio);
+  const kdZ = criticalKd(kp, I[2], dampingRatio);
 
-  const tauX = stablePDTorque(swingExcessX, relOmega.x, 0, 0, kp, kd, dt, I[0]);
-  const tauY = stablePDTorque(twistExcess,  relOmega.y, 0, 0, kp, kd, dt, I[1]);
-  const tauZ = stablePDTorque(swingExcessZ, relOmega.z, 0, 0, kp, kd, dt, I[2]);
+  const tauX = stablePDTorque(swingExcessX, relOmega.x, 0, 0, kp, kdX, dt, I[0]);
+  const tauY = stablePDTorque(twistExcess,  relOmega.y, 0, 0, kp, kdY, dt, I[1]);
+  const tauZ = stablePDTorque(swingExcessZ, relOmega.z, 0, 0, kp, kdZ, dt, I[2]);
 
   applyClampedTorque(parent, child, new Vec3(tauX, tauY, tauZ), MAX_LIMB_TORQUE);
 }
@@ -81,27 +92,26 @@ export function applyPoseTracking(
   child: RigidBody,
   poseTarget: Quat,
   kp: number,
-  kd: number,
+  dampingRatio: number,
   dt: number,
   availability = 1,
 ): void {
-  // currentRel = parent^-1 * child
   const currentRel = computeRelative(parent, child);
-  // Error rotation = poseTarget * currentRel^-1
   const currentRelInv = new Quat(-currentRel.x, -currentRel.y, -currentRel.z, currentRel.w);
   const err = Quat.mul(poseTarget, currentRelInv, new Quat());
-  // Continuity: choose shortest arc.
   if (err.w < 0) { err.x = -err.x; err.y = -err.y; err.z = -err.z; err.w = -err.w; }
   const errLog = err.toLog(new Vec3());
 
   const relOmega = relativeAngularVelocity(parent, child);
   const I = effectiveInertiaParentFrame(child, currentRel);
-
   const k = kp * availability;
-  const d = kd * Math.sqrt(availability);
-  const tauX = stablePDTorque(0, relOmega.x, errLog.x, 0, k, d, dt, I[0]);
-  const tauY = stablePDTorque(0, relOmega.y, errLog.y, 0, k, d, dt, I[1]);
-  const tauZ = stablePDTorque(0, relOmega.z, errLog.z, 0, k, d, dt, I[2]);
+  const kdX = criticalKd(k, I[0], dampingRatio);
+  const kdY = criticalKd(k, I[1], dampingRatio);
+  const kdZ = criticalKd(k, I[2], dampingRatio);
+
+  const tauX = stablePDTorque(0, relOmega.x, errLog.x, 0, k, kdX, dt, I[0]);
+  const tauY = stablePDTorque(0, relOmega.y, errLog.y, 0, k, kdY, dt, I[1]);
+  const tauZ = stablePDTorque(0, relOmega.z, errLog.z, 0, k, kdZ, dt, I[2]);
 
   applyClampedTorque(parent, child, new Vec3(tauX, tauY, tauZ), MAX_TRACK_TORQUE);
 }
