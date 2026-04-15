@@ -1,5 +1,6 @@
 import { Vec3 } from '../math/Vec3';
 import { Vec2 } from '../math/Vec2';
+import { Quat } from '../math/Quat';
 import { World } from '../physics/World';
 import { Climber, LimbGrip } from '../climber/Climber';
 import { Wall, buildDefaultWall } from '../wall/Wall';
@@ -31,6 +32,12 @@ export interface GameSnapshot {
   wallAngle: number;
   topReached: boolean;
   bodies: Array<{ id: string; pos: [number, number, number]; quat: [number, number, number, number]; length: number; radius: number }>;
+  /** Per-limb reach state for HUD / renderer. */
+  reachTargets: Record<string, string | null>;
+  /** World-space tip position of each limb (for renderer to draw reach lines). */
+  limbTips: Record<string, [number, number, number]>;
+  /** Player's current body-lean bias in [-1, 1] for x and y. */
+  bodyLean: [number, number];
 }
 
 /**
@@ -46,7 +53,15 @@ export class Game {
   // Input state (mutated externally by React UI)
   activeLimb: LimbGrip['limb'] = 'R_hand';
   selectedHold: Hold | null = null;
-  pendingAction: 'grip' | 'release' | null = null;
+  pendingAction: 'grip' | 'release' | 'reach' | null = null;
+  /** Per-limb active reach target. Null = no reach in progress. */
+  reachTargets: Map<LimbGrip['limb'], Hold> = new Map();
+  /** Player WASD body lean bias in [-1, 1]^2 (x = lateral, y = forward). */
+  bodyLean: Vec2 = new Vec2(0, 0);
+  /** Distance threshold (m) at which an active reach auto-attaches. The
+   *  generous threshold reflects that a real climber "grabs" a hold when
+   *  their hand is near it, not just when fingertip-precise. */
+  autoAttachDistance = 0.30;
 
   // Difficulty/Stability snapshots
   private lastMoveDifficulty = 0;
@@ -94,15 +109,38 @@ export class Game {
   }
 
   private stepFixed(dt: number): void {
-    // Handle pending input
+    // --- Handle pending one-shot input ---
     if (this.pendingAction === 'release') {
       this.climber.releaseGrip(this.activeLimb);
+      this.climber.cancelReach(this.activeLimb);
+      this.reachTargets.delete(this.activeLimb);
       this.pendingAction = null;
     } else if (this.pendingAction === 'grip' && this.selectedHold) {
       this.climber.attachGrip(this.activeLimb, this.selectedHold);
+      this.climber.cancelReach(this.activeLimb);
+      this.reachTargets.delete(this.activeLimb);
       this.pendingAction = null;
-      // Check top
       if (this.selectedHold.id === 'top') this.topReached = true;
+    } else if (this.pendingAction === 'reach' && this.selectedHold) {
+      // Begin reaching toward selected hold with active limb.
+      this.climber.releaseGrip(this.activeLimb);
+      this.reachTargets.set(this.activeLimb, this.selectedHold);
+      this.pendingAction = null;
+    }
+
+    // --- Update body-lean pose targets (spine + hips bias toward CoM target) ---
+    this.applyBodyLean();
+
+    // --- Run IK for any active reach + auto-attach when close ---
+    for (const [limb, hold] of this.reachTargets) {
+      this.climber.reachToward(limb, hold.position);
+      const tip = this.climber.limbTipWorld(limb);
+      if (tip.distanceTo(hold.position) < this.autoAttachDistance) {
+        this.climber.attachGrip(limb, hold);
+        this.climber.cancelReach(limb);
+        this.reachTargets.delete(limb);
+        if (hold.id === 'top') this.topReached = true;
+      }
     }
 
     this.climber.prePhysicsStep(dt);
@@ -111,6 +149,30 @@ export class Game {
 
     this.updateDifficulty();
     this.detectFall();
+  }
+
+  /**
+   * Translate the player's WASD lean bias into a target world-frame
+   * orientation for the pelvis (driven by the postural controller) plus a
+   * little knee flex if the player leans into the wall. The spine joints
+   * stay at rest so the trunk rides with the pelvis.
+   */
+  private applyBodyLean(): void {
+    const lateralRad = this.bodyLean.x * 0.40;   // up to ~23° pelvis tilt
+    const pitchRad   = -this.bodyLean.y * 0.30;  // forward = lean toward wall
+
+    const roll = Quat.fromAxisAngle(new Vec3(0, 0, 1), lateralRad);
+    const tilt = Quat.fromAxisAngle(new Vec3(1, 0, 0), pitchRad);
+    this.climber.pelvisOrientationTarget.copy(Quat.mul(roll, tilt, new Quat()).normalize());
+
+    // Knee bend bias from forward lean (squat into the wall).
+    const kneeFlex = Math.max(0, this.bodyLean.y) * 0.7; // [0, 0.7] rad
+    for (const knee of ['L_knee_j', 'R_knee_j']) {
+      const rest = this.climber.jointRestRelative.get(knee);
+      if (!rest) continue;
+      const flex = Quat.fromAxisAngle(new Vec3(1, 0, 0), kneeFlex);
+      this.climber.setJointTarget(knee, Quat.mul(rest, flex, new Quat()).normalize());
+    }
   }
 
   private updateDifficulty(): void {
@@ -173,6 +235,24 @@ export class Game {
   selectHold(hold: Hold | null): void { this.selectedHold = hold; }
   requestGrip(): void { this.pendingAction = 'grip'; }
   requestRelease(): void { this.pendingAction = 'release'; }
+  /**
+   * Begin reaching the active limb toward the selected hold. The reach
+   * persists until the limb auto-attaches (within `autoAttachDistance`) or the
+   * player presses release / triggers another reach.
+   */
+  requestReach(): void { this.pendingAction = 'reach'; }
+  cancelReach(limb?: LimbGrip['limb']): void {
+    const l = limb ?? this.activeLimb;
+    this.climber.cancelReach(l);
+    this.reachTargets.delete(l);
+  }
+  /** Bias the climber's CoM target. Each component clamped to [-1, 1]. */
+  setLean(x: number, y: number): void {
+    this.bodyLean.set(
+      Math.max(-1, Math.min(1, x)),
+      Math.max(-1, Math.min(1, y)),
+    );
+  }
   reset(): void {
     // Simplest: rebuild the whole game.
     this.world = new World();
@@ -184,6 +264,8 @@ export class Game {
     this.accumulator = 0;
     this.pendingAction = null;
     this.selectedHold = null;
+    this.reachTargets.clear();
+    this.bodyLean.set(0, 0);
 
     this.alignStartHoldsToClimber();
 
@@ -251,6 +333,19 @@ export class Game {
       });
     }
 
+    const reachTargets: Record<string, string | null> = {
+      L_hand: this.reachTargets.get('L_hand')?.id ?? null,
+      R_hand: this.reachTargets.get('R_hand')?.id ?? null,
+      L_foot: this.reachTargets.get('L_foot')?.id ?? null,
+      R_foot: this.reachTargets.get('R_foot')?.id ?? null,
+    };
+
+    const limbTips: Record<string, [number, number, number]> = {};
+    for (const limb of ['L_hand', 'R_hand', 'L_foot', 'R_foot'] as LimbGrip['limb'][]) {
+      const tip = this.climber.limbTipWorld(limb);
+      limbTips[limb] = [tip.x, tip.y, tip.z];
+    }
+
     return {
       t: this.t,
       climberPos: [com.x, com.y, com.z],
@@ -274,6 +369,9 @@ export class Game {
       wallAngle: this.wall.angle,
       topReached: this.topReached,
       bodies,
+      reachTargets,
+      limbTips,
+      bodyLean: [this.bodyLean.x, this.bodyLean.y],
     };
   }
 }

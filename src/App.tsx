@@ -32,6 +32,9 @@ export function App() {
     gameRef.current = game;
     rendererRef.current = renderer;
 
+    // Held WASD keys produce a continuous body-lean bias.
+    const heldKeys = new Set<string>();
+
     let lastT = performance.now();
     let uiAccum = 0;
     let raf = 0;
@@ -39,6 +42,15 @@ export function App() {
       const now = performance.now();
       const dt = (now - lastT) / 1000;
       lastT = now;
+
+      // Translate held WASD into a smoothed lean target.
+      const lx = (heldKeys.has('d') ? 1 : 0) - (heldKeys.has('a') ? 1 : 0);
+      const ly = (heldKeys.has('w') ? 1 : 0) - (heldKeys.has('s') ? 1 : 0);
+      // Smoothed approach so lean ramps in/out instead of snapping.
+      const cur = game.bodyLean;
+      const tau = 5;  // 1/s — higher = snappier
+      const a = 1 - Math.exp(-dt * tau);
+      game.setLean(cur.x + (lx - cur.x) * a, cur.y + (ly - cur.y) * a);
 
       game.tick(dt);
       const s = game.snapshot();
@@ -54,24 +66,38 @@ export function App() {
     };
     raf = requestAnimationFrame(tick);
 
-    // Keyboard
-    const onKey = (e: KeyboardEvent) => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const k = e.key.toLowerCase();
+      if (['w', 'a', 's', 'd'].includes(k)) {
+        heldKeys.add(k);
+        return;
+      }
       switch (e.key) {
         case '1': game.selectLimb('L_hand'); break;
         case '2': game.selectLimb('R_hand'); break;
         case '3': game.selectLimb('L_foot'); break;
         case '4': game.selectLimb('R_foot'); break;
+        case 'f': case 'F': game.requestReach(); break;
         case 'g': case 'G': game.requestGrip(); break;
         case 'x': case 'X': game.requestRelease(); break;
         case 'r': case 'R': game.reset(); break;
       }
       forceUpdate(x => x + 1);
     };
-    window.addEventListener('keydown', onKey);
+    const onKeyUp = (e: KeyboardEvent) => {
+      const k = e.key.toLowerCase();
+      if (['w', 'a', 's', 'd'].includes(k)) heldKeys.delete(k);
+    };
+    const onBlur = () => heldKeys.clear();
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
 
     return () => {
       cancelAnimationFrame(raf);
-      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
       renderer.dispose();
     };
   }, []);

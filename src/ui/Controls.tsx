@@ -12,11 +12,14 @@ export function Controls({ game, snap, onAction }: {
   snap: GameSnapshot;
   onAction: () => void;
 }) {
+  const reachActive = !!snap.reachTargets[snap.activeLimb];
+
   return (
     <div style={{
       position: 'absolute', bottom: 12, left: 12,
       background: 'rgba(10, 10, 16, 0.82)', padding: 12, borderRadius: 8,
       fontSize: 12, lineHeight: 1.4, pointerEvents: 'auto', display: 'flex', flexDirection: 'column', gap: 8,
+      minWidth: 320,
     }}>
       <div style={{ fontSize: 11, color: '#aaa' }}>Active limb</div>
       <div style={{ display: 'flex', gap: 4 }}>
@@ -29,26 +32,37 @@ export function Controls({ game, snap, onAction }: {
               background: snap.activeLimb === l ? '#ffe066' : '#222',
               color: snap.activeLimb === l ? '#000' : '#ddd', cursor: 'pointer',
               fontWeight: 600, minWidth: 38,
+              outline: snap.reachTargets[l] ? '2px solid #42a5f5' : 'none',
             }}
+            title={snap.reachTargets[l] ? `reaching → ${snap.reachTargets[l]}` : ''}
           >
             {limbLabels[l]}
           </button>
         ))}
       </div>
 
-      <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+      <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+        <button
+          onClick={() => { game.requestReach(); onAction(); }}
+          disabled={!snap.selectedHold}
+          style={buttonStyle(snap.selectedHold != null, '#42a5f5')}
+          title="Move limb toward selected hold (auto-grip when close)"
+        >
+          Reach (F)
+        </button>
         <button
           onClick={() => { game.requestGrip(); onAction(); }}
           disabled={!snap.selectedHold}
           style={buttonStyle(snap.selectedHold != null, '#4caf50')}
+          title="Snap-attach to selected hold immediately"
         >
-          Grip
+          Grip (G)
         </button>
         <button
           onClick={() => { game.requestRelease(); onAction(); }}
           style={buttonStyle(true, '#f44336')}
         >
-          Release
+          Release (X)
         </button>
         <button
           onClick={() => { game.reset(); onAction(); }}
@@ -58,9 +72,35 @@ export function Controls({ game, snap, onAction }: {
         </button>
       </div>
 
-      <div style={{ fontSize: 10, color: '#888', maxWidth: 280, marginTop: 4 }}>
-        Click a hold on the wall, pick a limb, then press Grip.
-        Keys: 1–4 select limb · G grip · X release · R reset.
+      <LeanPad lean={snap.bodyLean} />
+
+      <div style={{ fontSize: 10, color: '#888', maxWidth: 320, marginTop: 4, lineHeight: 1.5 }}>
+        <b>Climb:</b> click a hold → pick a limb (1–4) → press <b>Reach (F)</b>.
+        The limb extends toward the hold and auto-grips when close.<br/>
+        <b>Balance:</b> hold <b>WASD</b> to lean the body — shift weight before
+        a hard reach so the climber doesn't barn-door off.
+      </div>
+    </div>
+  );
+}
+
+/** Mini compass showing the player's current body lean direction. */
+function LeanPad({ lean }: { lean: [number, number] }) {
+  const size = 70;
+  const radius = (size - 16) / 2;
+  const cx = lean[0] * radius + size / 2;
+  const cy = -lean[1] * radius + size / 2;
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6 }}>
+      <svg width={size} height={size} style={{ background: '#1a1a22', borderRadius: 8 }}>
+        <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="#333" strokeWidth={1} />
+        <line x1={size / 2} y1={4} x2={size / 2} y2={size - 4} stroke="#333" strokeWidth={1} />
+        <line x1={4} y1={size / 2} x2={size - 4} y2={size / 2} stroke="#333" strokeWidth={1} />
+        <circle cx={cx} cy={cy} r={6} fill="#ffe066" />
+      </svg>
+      <div style={{ fontSize: 10, color: '#aaa' }}>
+        Body lean (WASD)<br/>
+        <span style={{ color: '#ddd' }}>x = {lean[0].toFixed(2)} · y = {lean[1].toFixed(2)}</span>
       </div>
     </div>
   );

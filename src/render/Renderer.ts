@@ -27,6 +27,8 @@ export class Renderer {
   private capsules = new Map<string, THREE.Mesh>();
   private holdMeshes = new Map<string, THREE.Mesh>();
   private holdHighlight: THREE.Mesh;
+  private reachLines = new Map<string, THREE.Line>();
+  private activeTipMarker!: THREE.Mesh;
   private onHoldPick: ((hold: Hold | null) => void) | null = null;
   private containerEl: HTMLElement;
 
@@ -75,6 +77,31 @@ export class Renderer {
     this.holdHighlight = new THREE.Mesh(ringGeom, ringMat);
     this.holdHighlight.visible = false;
     this.scene.add(this.holdHighlight);
+
+    // Reach guide line — a glowing line from each reaching limb to its
+    // target hold. Updated each frame in applySnapshot. Pre-allocate four
+    // (one per limb).
+    for (const limb of ['L_hand', 'R_hand', 'L_foot', 'R_foot']) {
+      const geom = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(), new THREE.Vector3(),
+      ]);
+      const mat = new THREE.LineBasicMaterial({
+        color: limb.includes('hand') ? 0x42a5f5 : 0xffa94d,
+        transparent: true, opacity: 0.7,
+      });
+      const line = new THREE.Line(geom, mat);
+      line.visible = false;
+      this.scene.add(line);
+      this.reachLines.set(limb, line);
+    }
+
+    // Active-limb tip marker — a small sphere on the climber's currently
+    // selected limb so the player can see what they're moving.
+    const tipGeom = new THREE.SphereGeometry(0.04, 12, 10);
+    const tipMat = new THREE.MeshBasicMaterial({ color: 0xffe066, transparent: true, opacity: 0.8 });
+    this.activeTipMarker = new THREE.Mesh(tipGeom, tipMat);
+    this.activeTipMarker.visible = false;
+    this.scene.add(this.activeTipMarker);
 
     // Wall + pointer events
     this.renderer.domElement.addEventListener('pointerdown', (e) => this.handlePointerDown(e));
@@ -159,6 +186,30 @@ export class Renderer {
       }
     } else {
       this.holdHighlight.visible = false;
+    }
+
+    // Reach guide lines: for each limb that's actively reaching, draw a line
+    // from its current tip to the target hold.
+    for (const [limb, line] of this.reachLines) {
+      const targetId = snap.reachTargets[limb];
+      if (!targetId) { line.visible = false; continue; }
+      const hold = snap.holds.find(h => h.id === targetId);
+      const tip = snap.limbTips[limb];
+      if (!hold || !tip) { line.visible = false; continue; }
+      line.visible = true;
+      const positions = (line.geometry.attributes.position as THREE.BufferAttribute);
+      positions.setXYZ(0, tip[0], tip[1], tip[2]);
+      positions.setXYZ(1, hold.position.x, hold.position.y, hold.position.z);
+      positions.needsUpdate = true;
+      line.geometry.computeBoundingSphere();
+    }
+
+    // Mark the currently-selected limb's tip with a yellow sphere so the
+    // player can see which limb is "active".
+    const activeTip = snap.limbTips[snap.activeLimb];
+    if (activeTip) {
+      this.activeTipMarker.visible = true;
+      this.activeTipMarker.position.set(activeTip[0], activeTip[1], activeTip[2]);
     }
 
     // Camera follow climber CoM with smoothing
