@@ -1,36 +1,40 @@
-/**
- * End-to-end Phase 3 test: settle, reach R hand to h2 (no pre-lean),
- * then reach L hand to h1, then verify multi-step climb works.
- */
 import { Game } from './src/game/Game.ts';
+
+(globalThis as any).__DEBUG_GRIP = true;
 
 const game = new Game(15);
 const dt = 1 / 120;
 const tick = (n: number) => { for (let i = 0; i < n; i++) game.tick(dt); };
 
-// Settle
-tick(300);
-console.log(`Settled. attached=${Object.values(game.snapshot().onHolds).filter(Boolean).length}/4`);
-
-// Reach R hand → h2
-const h2 = game.wall.holds.find(h => h.id === 'h2')!;
-game.selectLimb('R_hand');
-game.selectHold(h2);
-game.requestReach();
-tick(180);  // 1.5s
+console.log('--- 5s settle ---');
+tick(600);
 let s = game.snapshot();
-console.log(`After reach R→h2: R_hand=${s.onHolds.R_hand} attached=${Object.values(s.onHolds).filter(Boolean).length}/4`);
+console.log(`pelvis_y=${game.climber.bodies.get('pelvis')!.position.y.toFixed(3)} CoM=(${s.com.map(v=>v.toFixed(2)).join(',')}) attached=${Object.values(s.onHolds).filter(Boolean).length}/4 fails=${s.gripFailCount}`);
 
-// Reach L hand → h1 (cross-body for L hand → moderate)
-tick(60);
-const h1 = game.wall.holds.find(h => h.id === 'h1')!;
-game.selectLimb('L_hand');
-game.selectHold(h1);
-game.requestReach();
-tick(240);  // 2s
+console.log('\n--- Reach R→h2 ---');
+const h2 = game.wall.holds.find(h => h.id === 'h2')!;
+game.selectLimb('R_hand'); game.selectHold(h2); game.requestReach();
+tick(180);
 s = game.snapshot();
-console.log(`After reach L→h1: L_hand=${s.onHolds.L_hand} attached=${Object.values(s.onHolds).filter(Boolean).length}/4`);
+console.log(`R_hand=${s.onHolds.R_hand} CoM=(${s.com.map(v=>v.toFixed(2)).join(',')}) attached=${Object.values(s.onHolds).filter(Boolean).length}/4 fails=${s.gripFailCount}`);
 
-// Lean and check fatigue
-console.log(`\nFinal: attached=${Object.values(s.onHolds).filter(Boolean).length}/4 fails=${s.gripFailCount} pump=${s.forearmPump.toFixed(3)} fell=${s.fell}`);
+console.log('\n--- Lean left, then reach L→h1 ---');
+game.setLean(-0.6, 0.2);
+tick(120);
+const h1 = game.wall.holds.find(h => h.id === 'h1')!;
+game.selectLimb('L_hand'); game.selectHold(h1); game.requestReach();
+tick(240);
+s = game.snapshot();
+console.log(`L_hand=${s.onHolds.L_hand} CoM=(${s.com.map(v=>v.toFixed(2)).join(',')}) attached=${Object.values(s.onHolds).filter(Boolean).length}/4 fails=${s.gripFailCount}`);
+
+console.log('\n--- Center lean, reach R foot up ---');
+game.setLean(0, 0);
+tick(120);
+const fR1 = game.wall.holds.find(h => h.id === 'foot_R1')!;
+game.selectLimb('R_foot'); game.selectHold(fR1); game.requestReach();
+tick(240);
+s = game.snapshot();
+console.log(`R_foot=${s.onHolds.R_foot} CoM=(${s.com.map(v=>v.toFixed(2)).join(',')}) attached=${Object.values(s.onHolds).filter(Boolean).length}/4 fails=${s.gripFailCount}`);
+
+console.log(`\nFinal: pump=${s.forearmPump.toFixed(3)} fell=${s.fell} fails=${s.gripFailCount}`);
 console.log(`Holds: ${JSON.stringify(s.onHolds)}`);

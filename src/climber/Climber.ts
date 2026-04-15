@@ -295,12 +295,14 @@ export class Climber {
       if (grip.limb === 'L_hand' || grip.limb === 'R_hand') {
         const fat = this.fatigue.get('grip')!;
         const availableStrength = clamp(fat.M_R + fat.M_A, 0, 1) * lactScale;
-        // 2500 N peak — generous to absorb dynamic oscillation in the
-        // ragdoll. Will scale down with fatigue/grip availability.
-        const baseMaxForce = (grip.hold?.friction ?? 0.6) * 2500;
+        // 3500 N peak — generous to absorb the dynamic oscillation generated
+        // by the postural + leg-extension controllers when standing on feet.
+        // Real climbers can pull ~2× body-weight on a one-arm dead-hang;
+        // this is comparable. Scaled down by fatigue + intent.
+        const baseMaxForce = (grip.hold?.friction ?? 0.6) * 3500;
         grip.constraint.maxForce = baseMaxForce * availableStrength * grip.intent;
       } else {
-        grip.constraint.maxForce = 4000 * (grip.hold?.friction ?? 0.6);
+        grip.constraint.maxForce = 5500 * (grip.hold?.friction ?? 0.6);
       }
     }
   }
@@ -393,40 +395,50 @@ export class Climber {
     }
   }
 
-  // Per-region SPD gains. These are normalised by child inertia inside
-  // applyAngularLimits, so what matters here is the natural frequency
-  // ω_n = sqrt(kp). Higher kp = stiffer joint.
+  // Per-region SPD gains. SPD's per-step torque is bounded by
+  // ~posErr · I / dt²; with dt = 1/120 these gains saturate well below the
+  // applied torque cap, so what matters is having kp large enough that the
+  // joint can produce the torque the climber's body actually needs.
+  //
+  // Limits (gainForRegion) only fire when the joint exceeds its envelope —
+  // they need to be very stiff so a hyperextended joint snaps back.
   private gainForRegion(region: MuscleRegion): number {
     switch (region) {
-      case 'grip': return 150;
-      case 'trunk': return 300;
-      case 'shoulder': return 200;
-      case 'elbow': return 180;
-      case 'wrist': return 100;
-      case 'hip': return 250;
-      case 'knee': return 200;
-      case 'ankle': return 100;
-      case 'neck': return 60;
+      case 'grip': return 200;
+      case 'trunk': return 400;
+      case 'shoulder': return 250;
+      case 'elbow': return 220;
+      case 'wrist': return 120;
+      case 'hip': return 400;
+      case 'knee': return 350;
+      case 'ankle': return 150;
+      case 'neck': return 80;
     }
   }
 
-  /** Critical damping for a given kp. */
   private dampForRegion(region: MuscleRegion): number {
     return 2 * Math.sqrt(this.gainForRegion(region));
   }
 
-  /** Pose-tracking gain (softer than limits — limits dominate near edges). */
+  /**
+   * Pose-tracking gains. Legs (hip/knee) are stiffer than arms so the climber
+   * can stand on its feet — body weight transmits a flexion torque through
+   * each lower-body joint that the tracking has to overcome to keep the leg
+   * extended. But too stiff and the equilibrium reaction force exceeds the
+   * foot grip's max force and the foothold pops; the values below are tuned
+   * to land between those two failure modes.
+   */
   private trackingGainForRegion(region: MuscleRegion): number {
     switch (region) {
-      case 'grip': return 80;
-      case 'trunk': return 220;
-      case 'shoulder': return 180;
-      case 'elbow': return 160;
-      case 'wrist': return 60;
-      case 'hip': return 220;
-      case 'knee': return 180;
-      case 'ankle': return 80;
-      case 'neck': return 40;
+      case 'grip': return 100;
+      case 'trunk': return 200;
+      case 'shoulder': return 200;
+      case 'elbow': return 180;
+      case 'wrist': return 80;
+      case 'hip': return 350;
+      case 'knee': return 300;
+      case 'ankle': return 150;
+      case 'neck': return 50;
     }
   }
 
@@ -585,7 +597,10 @@ export class Climber {
     // For a rough diagonal approximation, we just use the average of the
     // body-local diag, which is acceptable for stabilisation purposes.
     const Iavg = (pelvis.inertiaLocal[0] + pelvis.inertiaLocal[1] + pelvis.inertiaLocal[2]) / 3;
-    const kp = 1500;   // Stiff postural drive — climbers actively brace.
+    // Tuned post-SPD-fix: previously was 1500 to compensate for the bugged
+    // controller producing ~120× too little torque. Now ~200 gives roughly
+    // the same physical brace as the climber's lower-back muscles.
+    const kp = 200;
     const kd = 2 * Math.sqrt(kp * Iavg);
 
     // Per-axis SPD: drive each angular component from 0 toward errLog (the
@@ -597,7 +612,7 @@ export class Climber {
       stablePDTorque(0, w.z, errLog.z, 0, kp, kd, dt, Iavg),
     );
     const m = tau.length();
-    if (m > 400) tau.scale(400 / m);
+    if (m > 250) tau.scale(250 / m);
     pelvis.applyTorque(tau);
   }
 }

@@ -27,8 +27,12 @@ export interface AngularLimits {
   twistMax: number;
 }
 
-const MAX_LIMB_TORQUE = 250;     // Nm — cap to bound transients
-const MAX_TRACK_TORQUE = 120;    // Nm — softer cap on pose tracking
+// Per-spec peak isometric torque for the strongest single-joint actuator
+// (hip extension) is 200 N·m. Limits and tracking can briefly exceed that
+// for stability transients, but we cap each so physics doesn't run away.
+const MAX_LIMB_TORQUE = 300;     // Nm — cap to bound transients
+const MAX_TRACK_TORQUE = 250;    // Nm — pose tracking, big enough to support
+                                 //       body weight through the legs.
 
 export function applyAngularLimits(
   parent: RigidBody,
