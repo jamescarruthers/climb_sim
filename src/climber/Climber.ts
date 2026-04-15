@@ -79,6 +79,16 @@ export class Climber {
   lastForearmPumpR = 0;
   gripFailCount = 0;
 
+  /**
+   * Player-controlled leg drive in [0, 1]. When non-zero, leg tracking
+   * gains are scaled up (powerful active extension) and a feedforward
+   * upward force is applied to the pelvis, simulating a climber actively
+   * pushing through their feet to stand up / launch the body.
+   */
+  legDrive = 0;
+  /** Smoothed instantaneous drive force in newtons (ramps in/out). */
+  driveForce = 0;
+
   // Warmup: during the first `warmupSteps` physics substeps after
   // construction, grip constraints cannot break. This lets the body settle
   // out of its idealised T-pose spawn into a relaxed hang without a transient
@@ -254,6 +264,7 @@ export class Climber {
     //     toward the user-controllable poseTargets. SPD-based, with per-axis
     //     critical damping computed from the actual segment inertia inside
     //     the constraint functions.
+    const drive = clamp(this.legDrive, 0, 1);
     for (const j of JOINTS) {
       const a = this.bodies.get(j.parent)!;
       const b = this.bodies.get(j.child)!;
@@ -265,10 +276,49 @@ export class Climber {
         swingX: j.swingX, swingZ: j.swingZ,
         twistMin: j.twistMin, twistMax: j.twistMax,
       }, this.gainForRegion(j.muscleRegion), 1.0 /* critical */, dt);
-      applyPoseTracking(a, b, target,
-        this.trackingGainForRegion(j.muscleRegion),
+
+      let kpTrack = this.trackingGainForRegion(j.muscleRegion);
+      let trackTarget = target;
+      if (drive > 0 && (j.muscleRegion === 'hip' || j.muscleRegion === 'knee' || j.muscleRegion === 'ankle')) {
+        // Quads/glutes/calves fire hard — bump leg tracking gain and lock
+        // the target to the fully-extended rest pose.
+        kpTrack *= 1 + 2 * drive;
+        if (drive > 0.3) trackTarget = rest;
+      }
+      applyPoseTracking(a, b, trackTarget, kpTrack,
         0.7 /* slightly under-critical so reaches feel responsive */,
         dt, availability);
+    }
+
+    // --- Leg drive feedforward: a real climber's leg push generates a net
+    //     upward force on the body that the joint-by-joint pose tracking
+    //     can't reliably reproduce because the multi-joint kinematic chain
+    //     oscillates at high gains. Add the missing impulse directly to the
+    //     pelvis so SPACE actually lifts the climber. The force is gated by
+    //     having both feet attached (no air-drive cheating) and scaled by
+    //     leg-region availability so a pumped climber can't push as hard.
+    {
+      const lFoot = this.grips.find(g => g.limb === 'L_foot')!;
+      const rFoot = this.grips.find(g => g.limb === 'R_foot')!;
+      const feetAttached = (lFoot.constraint ? 1 : 0) + (rFoot.constraint ? 1 : 0);
+      // Ramp the drive force toward its target with a short time constant
+      // so the body doesn't bounce when the player taps SPACE on/off.
+      const hipFat = this.fatigue.get('hip')!;
+      const kneeFat = this.fatigue.get('knee')!;
+      const legAvail = 0.5 * (
+        clamp(hipFat.M_R + hipFat.M_A, 0, 1) +
+        clamp(kneeFat.M_R + kneeFat.M_A, 0, 1)
+      ) * lactScale;
+      // 1100 N at full drive: enough to lift the climber ~20cm but not so
+      // much that body bobs violently when SPACE is held.
+      const targetForce = feetAttached === 0 ? 0
+        : 1100 * drive * legAvail * (feetAttached / 2);
+      const tau = 0.08; // 80 ms ramp constant
+      this.driveForce += (targetForce - this.driveForce) * (1 - Math.exp(-dt / tau));
+      if (this.driveForce > 0.5) {
+        const pelvis = this.bodies.get('pelvis')!;
+        pelvis.applyForce(new Vec3(0, this.driveForce, 0));
+      }
     }
 
     // --- MTG torques: modulate each joint's output by available fatigue strength
@@ -424,22 +474,25 @@ export class Climber {
    * constraint from segment inertia, so kp directly sets responsiveness
    * (kp = ω_n² · I).
    *
-   * Trunk needs to be the stiffest — when an arm muscle fires, the equal-
-   * and-opposite reaction torque hits the thorax, and a soft trunk lets
-   * the whole upper body rotate (which dragged the IK target around in
-   * earlier tuning). Legs are stiff enough to hold a stand. Arms are
-   * intentionally moderate so a reach is firm but doesn't whip.
+   *   * Legs are deliberately strong (4000–5000) so the climber can actively
+   *     extend against body weight — a real climber's quads/glutes can
+   *     produce 2–3× body-weight at the foot during a leg drive. The
+   *     pose target stays at full extension (T-pose); the strong kp
+   *     means equilibrium happens at a much smaller knee/hip flex angle,
+   *     so the climber stands tall instead of crouched.
+   *   * Trunk 2500 anchors the body so arm reactions don't whip it around.
+   *   * Arms are moderate so reaches feel firm but don't whip.
    */
   private trackingGainForRegion(region: MuscleRegion): number {
     switch (region) {
       case 'grip': return 300;
-      case 'trunk': return 2500;   // stiff: anchors the body during arm reaches
+      case 'trunk': return 2500;
       case 'shoulder': return 500;
       case 'elbow': return 500;
       case 'wrist': return 200;
-      case 'hip': return 1500;
-      case 'knee': return 1200;
-      case 'ankle': return 500;
+      case 'hip': return 5000;     // active hip extension — push body up
+      case 'knee': return 4000;    // active knee extension — push body up
+      case 'ankle': return 1500;
       case 'neck': return 150;
     }
   }
@@ -595,10 +648,7 @@ export class Climber {
     // For a rough diagonal approximation, we just use the average of the
     // body-local diag, which is acceptable for stabilisation purposes.
     const Iavg = (pelvis.inertiaLocal[0] + pelvis.inertiaLocal[1] + pelvis.inertiaLocal[2]) / 3;
-    // Tuned post-SPD-fix: previously was 1500 to compensate for the bugged
-    // controller producing ~120× too little torque. Now ~200 gives roughly
-    // the same physical brace as the climber's lower-back muscles.
-    const kp = 200;
+    const kp = 600;
     const kd = 2 * Math.sqrt(kp * Iavg);
 
     // Per-axis SPD: drive each angular component from 0 toward errLog (the

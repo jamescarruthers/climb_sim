@@ -32,7 +32,7 @@ export function App() {
     gameRef.current = game;
     rendererRef.current = renderer;
 
-    // Held WASD keys produce a continuous body-lean bias.
+    // Held WASD keys produce a continuous body-lean bias; SPACE is leg drive.
     const heldKeys = new Set<string>();
 
     let lastT = performance.now();
@@ -52,6 +52,12 @@ export function App() {
       const a = 1 - Math.exp(-dt * tau);
       game.setLean(cur.x + (lx - cur.x) * a, cur.y + (ly - cur.y) * a);
 
+      // Leg drive: SPACE held → ramp to 1; released → decay to 0.
+      const driveTarget = heldKeys.has(' ') ? 1 : 0;
+      const driveCur = game.legDriveCmd;
+      const driveTau = 8; // ramps in fast, decays fast
+      game.setLegDrive(driveCur + (driveTarget - driveCur) * (1 - Math.exp(-dt * driveTau)));
+
       game.tick(dt);
       const s = game.snapshot();
       renderer.applySnapshot(s);
@@ -68,7 +74,8 @@ export function App() {
 
     const onKeyDown = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
-      if (['w', 'a', 's', 'd'].includes(k)) {
+      if (['w', 'a', 's', 'd'].includes(k) || e.key === ' ') {
+        if (e.key === ' ') e.preventDefault();   // stop page scroll
         heldKeys.add(k);
         return;
       }
@@ -86,7 +93,7 @@ export function App() {
     };
     const onKeyUp = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
-      if (['w', 'a', 's', 'd'].includes(k)) heldKeys.delete(k);
+      if (['w', 'a', 's', 'd'].includes(k) || e.key === ' ') heldKeys.delete(k);
     };
     const onBlur = () => heldKeys.clear();
     window.addEventListener('keydown', onKeyDown);

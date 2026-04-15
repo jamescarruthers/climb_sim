@@ -33,9 +33,12 @@ export interface AngularLimits {
 // Per-spec peak isometric torque for the strongest single-joint actuator
 // (hip extension) is 200 N·m. Limits and tracking can briefly exceed that
 // for stability transients, but we cap each so physics doesn't run away.
-const MAX_LIMB_TORQUE = 300;     // Nm — cap to bound transients
-const MAX_TRACK_TORQUE = 250;    // Nm — pose tracking, big enough to support
-                                 //       body weight through the legs.
+// Tracking cap is generous because legs need to push body weight UP, not
+// just hold it static — a real squat / leg drive transmits 2–3× body
+// weight through the knee on the concentric phase.
+const MAX_LIMB_TORQUE = 400;     // Nm — cap to bound transients
+const MAX_TRACK_TORQUE = 450;    // Nm — pose tracking; legs need this for
+                                 //       active extension against gravity.
 
 /** kd for critical damping at gain `kp` on a body with effective inertia `I`. */
 function criticalKd(kp: number, I: number, ratio: number): number {

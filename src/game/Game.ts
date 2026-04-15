@@ -38,6 +38,8 @@ export interface GameSnapshot {
   limbTips: Record<string, [number, number, number]>;
   /** Player's current body-lean bias in [-1, 1] for x and y. */
   bodyLean: [number, number];
+  /** Player's leg-drive command in [0, 1]. */
+  legDrive: number;
 }
 
 /**
@@ -58,6 +60,8 @@ export class Game {
   reachTargets: Map<LimbGrip['limb'], Hold> = new Map();
   /** Player WASD body lean bias in [-1, 1]^2 (x = lateral, y = forward). */
   bodyLean: Vec2 = new Vec2(0, 0);
+  /** Player leg-drive command in [0, 1]. Held SPACE → 1, otherwise decays. */
+  legDriveCmd = 0;
   /** Distance threshold (m) at which an active reach auto-attaches. The
    *  generous threshold reflects that a real climber "grabs" a hold when
    *  their hand is near it, not just when fingertip-precise. */
@@ -130,6 +134,8 @@ export class Game {
 
     // --- Update body-lean pose targets (spine + hips bias toward CoM target) ---
     this.applyBodyLean();
+    // --- Apply leg drive command directly to the climber.
+    this.climber.legDrive = this.legDriveCmd;
 
     // --- Run IK for any active reach + auto-attach when close ---
     for (const [limb, hold] of this.reachTargets) {
@@ -253,6 +259,10 @@ export class Game {
       Math.max(-1, Math.min(1, y)),
     );
   }
+  /** Set the climber's commanded leg drive [0, 1]. */
+  setLegDrive(d: number): void {
+    this.legDriveCmd = Math.max(0, Math.min(1, d));
+  }
   reset(): void {
     // Simplest: rebuild the whole game.
     this.world = new World();
@@ -372,6 +382,7 @@ export class Game {
       reachTargets,
       limbTips,
       bodyLean: [this.bodyLean.x, this.bodyLean.y],
+      legDrive: this.legDriveCmd,
     };
   }
 }
