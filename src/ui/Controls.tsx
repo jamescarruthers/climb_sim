@@ -72,24 +72,27 @@ export function Controls({ game, snap, onAction }: {
         </button>
       </div>
 
-      <LeanPad lean={snap.bodyLean} />
+      <LeanPad lean={snap.bodyLean} legDrive={snap.legDrive} />
 
       <div style={{ fontSize: 10, color: '#888', maxWidth: 320, marginTop: 4, lineHeight: 1.5 }}>
         <b>Climb:</b> click a hold → pick a limb (1–4) → press <b>Reach (F)</b>.
         The limb extends toward the hold and auto-grips when close.<br/>
         <b>Balance:</b> hold <b>WASD</b> to lean the body — shift weight before
-        a hard reach so the climber doesn't barn-door off.
+        a hard reach so the climber doesn't barn-door off.<br/>
+        <b>Push:</b> hold <b>SPACE</b> to drive through the legs — quads + glutes
+        fire to extend the legs hard, launching the body upward.
       </div>
     </div>
   );
 }
 
-/** Mini compass showing the player's current body lean direction. */
-function LeanPad({ lean }: { lean: [number, number] }) {
+/** Mini compass + leg-drive bar showing the player's body lean and push. */
+function LeanPad({ lean, legDrive }: { lean: [number, number]; legDrive: number }) {
   const size = 70;
   const radius = (size - 16) / 2;
   const cx = lean[0] * radius + size / 2;
   const cy = -lean[1] * radius + size / 2;
+  const drivePct = Math.max(0, Math.min(1, legDrive)) * 100;
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6 }}>
       <svg width={size} height={size} style={{ background: '#1a1a22', borderRadius: 8 }}>
@@ -98,9 +101,15 @@ function LeanPad({ lean }: { lean: [number, number] }) {
         <line x1={4} y1={size / 2} x2={size - 4} y2={size / 2} stroke="#333" strokeWidth={1} />
         <circle cx={cx} cy={cy} r={6} fill="#ffe066" />
       </svg>
-      <div style={{ fontSize: 10, color: '#aaa' }}>
+      <div style={{ fontSize: 10, color: '#aaa', flex: 1 }}>
         Body lean (WASD)<br/>
         <span style={{ color: '#ddd' }}>x = {lean[0].toFixed(2)} · y = {lean[1].toFixed(2)}</span>
+        <div style={{ marginTop: 6 }}>
+          Leg drive (SPACE)
+          <div style={{ height: 6, background: '#222', borderRadius: 3, overflow: 'hidden', marginTop: 2 }}>
+            <div style={{ height: '100%', width: `${drivePct}%`, background: '#ff7043', transition: 'width 60ms' }} />
+          </div>
+        </div>
       </div>
     </div>
   );
