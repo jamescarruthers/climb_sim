@@ -11,8 +11,8 @@ export class World {
   pointConstraints: PointConstraint[] = [];
 
   gravity = new Vec3(0, -9.81, 0);
-  linearDamping = 0.3;
-  angularDamping = 0.8;
+  linearDamping = 0.4;
+  angularDamping = 1.2;
 
   solverIterations = 16;
 
