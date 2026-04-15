@@ -1,27 +1,38 @@
+/** Compare baseline vs one-shot-at-attach IK for a REACH scenario. */
 import { Game } from './src/game/Game.ts';
+import { Quat } from './src/math/Quat.ts';
 
-(globalThis as any).__DEBUG_GRIP = true;
-
-const game = new Game(15);
 const dt = 1 / 120;
 
-for (let i = 0; i < 600; i++) game.tick(dt);
+function runTest(useIK: boolean, label: string) {
+  console.log(`\n=== ${label} (useGrippedLimbIK = ${useIK}) ===`);
+  const game = new Game(15);
+  game.climber.useGrippedLimbIK = useIK;
 
-console.log('Settled.');
-const h2 = game.wall.holds.find(h => h.id === 'h2')!;
-console.log(`h2 at (${h2.position.x.toFixed(2)}, ${h2.position.y.toFixed(2)}, ${h2.position.z.toFixed(2)})`);
+  // Settle 5s
+  for (let i = 0; i < 600; i++) game.tick(dt);
+  let s = game.snapshot();
+  let p = game.climber.bodies.get('pelvis')!.position;
+  console.log(`settled: pelvis=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) att=${Object.values(s.onHolds).filter(Boolean).length}/4 fails=${s.gripFailCount}`);
 
-game.selectLimb('R_hand');
-game.selectHold(h2);
-game.requestReach();
-console.log('Reach requested.');
-
-for (let i = 0; i < 360; i++) {
-  game.tick(dt);
-  if (i % 12 === 0) {
-    const tip = game.climber.limbTipWorld('R_hand');
-    const dist = tip.clone().sub(h2.position).length();
-    const s = game.snapshot();
-    console.log(`  t=${game.t.toFixed(2)} tip=(${tip.x.toFixed(2)},${tip.y.toFixed(2)},${tip.z.toFixed(2)}) dist=${dist.toFixed(3)} R_hand=${s.onHolds.R_hand ?? '—'} reachActive=${s.reachTargets.R_hand ?? '—'}`);
+  // Reach R-hand to h2
+  const h2 = game.wall.holds.find(h => h.id === 'h2')!;
+  game.selectLimb('R_hand'); game.selectHold(h2); game.requestReach();
+  let attached_t = -1;
+  for (let i = 0; i < 360; i++) {
+    game.tick(dt);
+    if (game.snapshot().onHolds.R_hand === 'h2' && attached_t < 0) attached_t = game.t;
   }
+  s = game.snapshot();
+  p = game.climber.bodies.get('pelvis')!.position;
+  console.log(`after reach R→h2: attached_t=${attached_t.toFixed(2)} pelvis=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) att=${Object.values(s.onHolds).filter(Boolean).length}/4 fails=${s.gripFailCount}`);
+
+  // Settle 2s post-reach
+  for (let i = 0; i < 240; i++) game.tick(dt);
+  s = game.snapshot();
+  p = game.climber.bodies.get('pelvis')!.position;
+  console.log(`post-settle: pelvis=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) att=${Object.values(s.onHolds).filter(Boolean).length}/4 fails=${s.gripFailCount}`);
 }
+
+runTest(false, 'BASELINE');
+runTest(true, 'ONE-SHOT IK AT ATTACH');

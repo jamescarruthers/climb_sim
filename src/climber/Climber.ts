@@ -559,25 +559,33 @@ export class Climber {
     return body.localToWorld(this.limbTipLocal(limb), new Vec3());
   }
 
-  // CCD substep accumulator — IK runs at a slower rate than physics so the
-  // pose tracker has time to actually drive the limb where IK said to go.
+  // CCD substep accumulator — IK for an active reach runs at a slower rate
+  // than physics so the pose tracker has time to actually drive the limb
+  // where IK said to go. Gripped-limb IK (continuous pose-target update)
+  // runs every substep with a smaller slerp blend.
   private ikSubstepCounter = 0;
-  private static readonly IK_DECIMATE = 3;        // re-solve every 3 substeps (~40 Hz)
-  private static readonly IK_TARGET_BLEND = 0.6;  // slerp amount toward CCD output
+  private static readonly IK_DECIMATE = 3;          // re-solve every 3 substeps (~40 Hz)
+  private static readonly IK_TARGET_BLEND = 0.6;    // slerp amount toward CCD output (reach)
+
+  /** Distal (wrist/ankle) joint for each limb — kept at rest while the
+   *  proximal chain follows an IK target. */
+  private static readonly DISTAL_JOINT: Record<LimbGrip['limb'], string> = {
+    L_hand: 'L_wrist_j',
+    R_hand: 'R_wrist_j',
+    L_foot: 'L_ankle_j',
+    R_foot: 'R_ankle_j',
+  };
 
   /**
-   * One IK pass biasing the limb toward `target`. Run every physics substep
-   * while a reach is active. The CCD solver itself only runs every
-   * IK_DECIMATE substeps; the pose targets are slerped toward the CCD result
-   * by IK_TARGET_BLEND each time, producing a smooth glide rather than a
-   * yank.
+   * Core IK routine. Given a limb and a world-space target, solve CCD on
+   * the limb's 2-joint chain (shoulder+elbow / hip+knee) and blend the
+   * resulting parent-frame relative orientations into the pose targets.
+   * The distal joint (wrist/ankle) stays at rest so the end-effector in
+   * the CCD chain (the forearm/shin tip) maps to the actual hand/foot
+   * tip position.
    */
-  reachToward(limb: LimbGrip['limb'], target: Vec3): void {
-    this.ikSubstepCounter++;
-    if (this.ikSubstepCounter % Climber.IK_DECIMATE !== 0) return;
-
+  private runLimbIK(limb: LimbGrip['limb'], target: Vec3, blend: number): void {
     const chainIds = Climber.REACH_CHAINS[limb];
-    const lastJoint = JOINTS.find(j => j.id === chainIds[chainIds.length - 1])!;
     const chain: IKJointSpec[] = chainIds.map(jId => {
       const jd = JOINTS.find(j => j.id === jId)!;
       return {
@@ -597,15 +605,25 @@ export class Climber {
       const err = Quat.mul(restInv, raw, new Quat());
       const clamped = clampRelativeToLimits(err, jd.swingX, jd.swingZ, jd.twistMin, jd.twistMax);
       const final = Quat.mul(restRel, clamped, new Quat()).normalize();
-      // Slerp toward the new IK pose target instead of snapping.
-      const current = this.poseTargets.get(jId) ?? restRel;
-      this.poseTargets.set(jId, slerp(current, final, Climber.IK_TARGET_BLEND));
+      if (blend >= 1) {
+        this.poseTargets.set(jId, final);
+      } else {
+        const current = this.poseTargets.get(jId) ?? restRel;
+        this.poseTargets.set(jId, slerp(current, final, blend));
+      }
     }
-    // Distal joint stays in rest pose so the hand/foot follows the forearm/shin.
-    this.resetJointTarget(lastJoint.id === 'L_elbow_j' ? 'L_wrist_j'
-                       : lastJoint.id === 'R_elbow_j' ? 'R_wrist_j'
-                       : lastJoint.id === 'L_knee_j' ? 'L_ankle_j'
-                       : 'R_ankle_j');
+    this.resetJointTarget(Climber.DISTAL_JOINT[limb]);
+  }
+
+  /**
+   * One IK pass biasing an actively-reaching limb toward `target`. Called
+   * every physics substep; the CCD solver itself only runs every
+   * IK_DECIMATE substeps to give the pose tracker time to converge.
+   */
+  reachToward(limb: LimbGrip['limb'], target: Vec3): void {
+    this.ikSubstepCounter++;
+    if (this.ikSubstepCounter % Climber.IK_DECIMATE !== 0) return;
+    this.runLimbIK(limb, target, Climber.IK_TARGET_BLEND);
   }
 
   /** Reset all joints in a limb's reach chain to their rest targets. */
