@@ -251,7 +251,9 @@ export class Climber {
     this.applyPostural(dt);
 
     // --- Angular limits (relative to T-pose / restRelative) + pose tracking
-    //     toward the user-controllable poseTargets. SPD-based, stable for all I.
+    //     toward the user-controllable poseTargets. SPD-based, with per-axis
+    //     critical damping computed from the actual segment inertia inside
+    //     the constraint functions.
     for (const j of JOINTS) {
       const a = this.bodies.get(j.parent)!;
       const b = this.bodies.get(j.child)!;
@@ -262,10 +264,10 @@ export class Climber {
       applyAngularLimits(a, b, rest, {
         swingX: j.swingX, swingZ: j.swingZ,
         twistMin: j.twistMin, twistMax: j.twistMax,
-      }, this.gainForRegion(j.muscleRegion), this.dampForRegion(j.muscleRegion), dt);
+      }, this.gainForRegion(j.muscleRegion), 1.0 /* critical */, dt);
       applyPoseTracking(a, b, target,
         this.trackingGainForRegion(j.muscleRegion),
-        this.trackingDampForRegion(j.muscleRegion),
+        0.7 /* slightly under-critical so reaches feel responsive */,
         dt, availability);
     }
 
@@ -395,55 +397,51 @@ export class Climber {
     }
   }
 
-  // Per-region SPD gains. SPD's per-step torque is bounded by
-  // ~posErr · I / dt²; with dt = 1/120 these gains saturate well below the
-  // applied torque cap, so what matters is having kp large enough that the
-  // joint can produce the torque the climber's body actually needs.
-  //
-  // Limits (gainForRegion) only fire when the joint exceeds its envelope —
-  // they need to be very stiff so a hyperextended joint snaps back.
+  /**
+   * Per-region SPD natural-frequency-squared (kp). Damping is computed
+   * per-axis inside the constraint from the actual segment inertia, so kp
+   * here directly controls how snappy the joint responds — kp ≈ ω_n² × I.
+   *
+   * Limits only fire when the joint exceeds its envelope; they need to be
+   * stiff so a hyperextended joint snaps back.
+   */
   private gainForRegion(region: MuscleRegion): number {
     switch (region) {
-      case 'grip': return 200;
-      case 'trunk': return 400;
-      case 'shoulder': return 250;
-      case 'elbow': return 220;
-      case 'wrist': return 120;
-      case 'hip': return 400;
-      case 'knee': return 350;
-      case 'ankle': return 150;
-      case 'neck': return 80;
+      case 'grip': return 1200;
+      case 'trunk': return 2000;
+      case 'shoulder': return 1500;
+      case 'elbow': return 1500;
+      case 'wrist': return 600;
+      case 'hip': return 2000;
+      case 'knee': return 1800;
+      case 'ankle': return 800;
+      case 'neck': return 400;
     }
-  }
-
-  private dampForRegion(region: MuscleRegion): number {
-    return 2 * Math.sqrt(this.gainForRegion(region));
   }
 
   /**
-   * Pose-tracking gains. Legs (hip/knee) are stiffer than arms so the climber
-   * can stand on its feet — body weight transmits a flexion torque through
-   * each lower-body joint that the tracking has to overcome to keep the leg
-   * extended. But too stiff and the equilibrium reaction force exceeds the
-   * foot grip's max force and the foothold pops; the values below are tuned
-   * to land between those two failure modes.
+   * Pose-tracking gains. Per-axis critical damping is computed inside the
+   * constraint from segment inertia, so kp directly sets responsiveness
+   * (kp = ω_n² · I).
+   *
+   * Trunk needs to be the stiffest — when an arm muscle fires, the equal-
+   * and-opposite reaction torque hits the thorax, and a soft trunk lets
+   * the whole upper body rotate (which dragged the IK target around in
+   * earlier tuning). Legs are stiff enough to hold a stand. Arms are
+   * intentionally moderate so a reach is firm but doesn't whip.
    */
   private trackingGainForRegion(region: MuscleRegion): number {
     switch (region) {
-      case 'grip': return 100;
-      case 'trunk': return 200;
-      case 'shoulder': return 200;
-      case 'elbow': return 180;
-      case 'wrist': return 80;
-      case 'hip': return 350;
-      case 'knee': return 300;
-      case 'ankle': return 150;
-      case 'neck': return 50;
+      case 'grip': return 300;
+      case 'trunk': return 2500;   // stiff: anchors the body during arm reaches
+      case 'shoulder': return 500;
+      case 'elbow': return 500;
+      case 'wrist': return 200;
+      case 'hip': return 1500;
+      case 'knee': return 1200;
+      case 'ankle': return 500;
+      case 'neck': return 150;
     }
-  }
-
-  private trackingDampForRegion(region: MuscleRegion): number {
-    return 2 * Math.sqrt(this.trackingGainForRegion(region));
   }
 
   // ----- Public pose control -----
@@ -514,8 +512,8 @@ export class Climber {
   // CCD substep accumulator — IK runs at a slower rate than physics so the
   // pose tracker has time to actually drive the limb where IK said to go.
   private ikSubstepCounter = 0;
-  private static readonly IK_DECIMATE = 6;        // re-solve every 6 substeps (~20 Hz)
-  private static readonly IK_TARGET_BLEND = 0.35; // slerp amount toward CCD output
+  private static readonly IK_DECIMATE = 3;        // re-solve every 3 substeps (~40 Hz)
+  private static readonly IK_TARGET_BLEND = 0.6;  // slerp amount toward CCD output
 
   /**
    * One IK pass biasing the limb toward `target`. Run every physics substep
