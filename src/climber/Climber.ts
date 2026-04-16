@@ -10,7 +10,7 @@ import { SEGMENTS, DEFAULT_MASS, SegmentDef } from '../skeleton/segments';
 import { JOINTS, JointDef, MuscleRegion } from '../skeleton/joints';
 import { diagInertia } from '../skeleton/inertia';
 import { MTG } from '../muscle/MTG';
-import { mtgParamsForRegion } from '../muscle/params';
+import { mtgParamsForRegion, REGION_TMAX } from '../muscle/params';
 import { FatigueState, freshState, stepFatigue, FATIGUE_PARAMS,
          gripBloodFlowFactor, armPositionRecoveryFactor } from '../fatigue/ThreeCompartment';
 import { EnergyState, freshEnergy, stepEnergy, lactateStrengthScale } from '../energy/EnergySystem';
@@ -96,6 +96,12 @@ export class Climber {
   private warmupSteps = 240;     // ~2s at 120 Hz: fully damped settle
   private stepsSinceStart = 0;
 
+  /** For each joint id, the list of segment ids that are DOWNSTREAM of it
+   *  in the kinematic tree (including the joint's own child). Used by
+   *  gravity compensation: the torque each joint must apply to hold this
+   *  subtree against gravity is computed once per step from this list. */
+  private jointDescendants = new Map<string, string[]>();
+
   constructor(world: World, options: ClimberOptions = {}) {
     this.world = world;
     this.mass = options.mass ?? DEFAULT_MASS;
@@ -104,6 +110,7 @@ export class Climber {
     this.buildJoints();
     this.buildMTGs();
     this.initFatigue();
+    this.computeJointDescendants();
   }
 
   // ----- Construction helpers -----
@@ -200,6 +207,32 @@ export class Climber {
     }
   }
 
+  /**
+   * Walk the JOINTS tree once and store, per joint, the full list of
+   * segment ids downstream of it (its child + all descendants of the
+   * child). Used by applyGravityCompensation.
+   */
+  private computeJointDescendants(): void {
+    // Build a parent→children lookup from the JOINTS list so we can walk
+    // downward from any segment.
+    const children = new Map<string, string[]>();
+    for (const j of JOINTS) {
+      const list = children.get(j.parent) ?? [];
+      list.push(j.child);
+      children.set(j.parent, list);
+    }
+    for (const j of JOINTS) {
+      const descendants: string[] = [];
+      const stack: string[] = [j.child];
+      while (stack.length) {
+        const id = stack.pop()!;
+        descendants.push(id);
+        for (const c of children.get(id) ?? []) stack.push(c);
+      }
+      this.jointDescendants.set(j.id, descendants);
+    }
+  }
+
   // ----- Runtime step -----
 
   /**
@@ -260,6 +293,15 @@ export class Climber {
     //     drifts/tilts freely under gravity, dragging the whole body with it.
     this.applyPostural(dt);
 
+    // --- Gravity-compensation feedforward: for every joint, compute the
+    //     torque needed to hold the downstream subtree up against gravity,
+    //     and apply it as a baseline. Pose tracking then only has to deal
+    //     with deviations from this compensated equilibrium, not gravity
+    //     itself. (Previously, gravity was the dominant load and the body
+    //     sagged into a deep crouch because per-joint pose tracking couldn't
+    //     keep up.)
+    this.applyGravityCompensation(lactScale);
+
     // --- Angular limits (relative to T-pose / restRelative) + pose tracking
     //     toward the user-controllable poseTargets.
     const drive = clamp(this.legDrive, 0, 1);
@@ -287,31 +329,28 @@ export class Climber {
         dt, availability);
     }
 
-    // --- Leg drive feedforward: a real climber's leg push generates a net
-    //     upward force on the body that the joint-by-joint pose tracking
-    //     can't reliably reproduce because the multi-joint kinematic chain
-    //     oscillates at high gains. Add the missing impulse directly to the
-    //     pelvis so SPACE actually lifts the climber. The force is gated by
-    //     having both feet attached (no air-drive cheating) and scaled by
-    //     leg-region availability so a pumped climber can't push as hard.
+    // --- Leg drive feedforward: with gravity comp now handling the static
+    //     gravity load, this feedforward is the part of SPACE that actually
+    //     pushes the body upward. (Pose tracking alone can't — setting leg
+    //     pose targets to "fully extended" while the body is at less-than-
+    //     T-pose creates a large error that, via the constraint chain, ends
+    //     up pulling the body down if anything.) Gated on feet attached;
+    //     scaled by leg-region availability + lactate.
     {
       const lFoot = this.grips.find(g => g.limb === 'L_foot')!;
       const rFoot = this.grips.find(g => g.limb === 'R_foot')!;
       const feetAttached = (lFoot.constraint ? 1 : 0) + (rFoot.constraint ? 1 : 0);
-      // Ramp the drive force toward its target with a short time constant
-      // so the body doesn't bounce when the player taps SPACE on/off.
       const hipFat = this.fatigue.get('hip')!;
       const kneeFat = this.fatigue.get('knee')!;
       const legAvail = 0.5 * (
         clamp(hipFat.M_R + hipFat.M_A, 0, 1) +
         clamp(kneeFat.M_R + kneeFat.M_A, 0, 1)
       ) * lactScale;
-      // 1100 N at full drive: enough to lift the climber ~20cm but not so
-      // much that body bobs violently when SPACE is held.
       const targetForce = feetAttached === 0 ? 0
         : 1100 * drive * legAvail * (feetAttached / 2);
-      const tau = 0.08; // 80 ms ramp constant
-      this.driveForce += (targetForce - this.driveForce) * (1 - Math.exp(-dt / tau));
+      // Ramp so tapping SPACE doesn't bounce the body.
+      const tauRamp = 0.08;
+      this.driveForce += (targetForce - this.driveForce) * (1 - Math.exp(-dt / tauRamp));
       if (this.driveForce > 0.5) {
         const pelvis = this.bodies.get('pelvis')!;
         pelvis.applyForce(new Vec3(0, this.driveForce, 0));
@@ -344,13 +383,13 @@ export class Climber {
       if (grip.limb === 'L_hand' || grip.limb === 'R_hand') {
         const fat = this.fatigue.get('grip')!;
         const availableStrength = clamp(fat.M_R + fat.M_A, 0, 1) * lactScale;
-        // 3500 N peak — generous to absorb the dynamic oscillation
-        // generated by the postural + pose-tracking controllers when
-        // standing on feet, scaled down by fatigue + intent.
-        const baseMaxForce = (grip.hold?.friction ?? 0.6) * 3500;
+        // Baseline hand-grip peak force. Generous enough to absorb the
+        // dynamic reaction torques the postural + pose-tracking controllers
+        // generate, and the momentum transients that follow a fresh attach.
+        const baseMaxForce = (grip.hold?.friction ?? 0.6) * 4500;
         grip.constraint.maxForce = baseMaxForce * availableStrength * grip.intent;
       } else {
-        grip.constraint.maxForce = 5500 * (grip.hold?.friction ?? 0.6);
+        grip.constraint.maxForce = 6500 * (grip.hold?.friction ?? 0.6);
       }
     }
   }
@@ -402,7 +441,7 @@ export class Climber {
     g.hold = hold;
     g.constraint = c;
     g.intent = 1;
-    g.breakImmunity = 60;   // 0.5s grace period for the body to settle in.
+    g.breakImmunity = 120;  // 1.0s grace period for the body to settle in.
   }
 
   releaseGrip(limb: LimbGrip['limb']): void {
@@ -470,15 +509,11 @@ export class Climber {
    * constraint from segment inertia, so kp directly sets responsiveness
    * (kp = ω_n² · I).
    *
-   *   * Trunk is the stiffest — when an arm muscle fires, the equal-and-
-   *     opposite reaction torque hits the thorax, and a soft trunk lets
-   *     the whole upper body rotate (which dragged the IK target around
-   *     in earlier tuning).
-   *   * Legs are moderate. Higher gains here make the legs whip the body
-   *     during a reach (the same reaction-torque problem), which made
-   *     reaches fail. Active leg push for SPACE is a separate code path
-   *     (legDrive multiplier).
-   *   * Arms moderate so reaches feel firm but don't whip.
+   * Gravity compensation handles the static gravity load at every joint
+   * as a feedforward, so pose tracking only handles deviations; but these
+   * gains still need to be strong enough to push the body through reaches
+   * without the chain going limp. Trunk is the stiffest — it anchors the
+   * body against arm-reaction torques while the shoulder is reaching.
    */
   private trackingGainForRegion(region: MuscleRegion): number {
     switch (region) {
@@ -559,25 +594,33 @@ export class Climber {
     return body.localToWorld(this.limbTipLocal(limb), new Vec3());
   }
 
-  // CCD substep accumulator — IK runs at a slower rate than physics so the
-  // pose tracker has time to actually drive the limb where IK said to go.
+  // CCD substep accumulator — IK for an active reach runs at a slower rate
+  // than physics so the pose tracker has time to actually drive the limb
+  // where IK said to go. Gripped-limb IK (continuous pose-target update)
+  // runs every substep with a smaller slerp blend.
   private ikSubstepCounter = 0;
-  private static readonly IK_DECIMATE = 3;        // re-solve every 3 substeps (~40 Hz)
-  private static readonly IK_TARGET_BLEND = 0.6;  // slerp amount toward CCD output
+  private static readonly IK_DECIMATE = 3;          // re-solve every 3 substeps (~40 Hz)
+  private static readonly IK_TARGET_BLEND = 0.6;    // slerp amount toward CCD output (reach)
+
+  /** Distal (wrist/ankle) joint for each limb — kept at rest while the
+   *  proximal chain follows an IK target. */
+  private static readonly DISTAL_JOINT: Record<LimbGrip['limb'], string> = {
+    L_hand: 'L_wrist_j',
+    R_hand: 'R_wrist_j',
+    L_foot: 'L_ankle_j',
+    R_foot: 'R_ankle_j',
+  };
 
   /**
-   * One IK pass biasing the limb toward `target`. Run every physics substep
-   * while a reach is active. The CCD solver itself only runs every
-   * IK_DECIMATE substeps; the pose targets are slerped toward the CCD result
-   * by IK_TARGET_BLEND each time, producing a smooth glide rather than a
-   * yank.
+   * Core IK routine. Given a limb and a world-space target, solve CCD on
+   * the limb's 2-joint chain (shoulder+elbow / hip+knee) and blend the
+   * resulting parent-frame relative orientations into the pose targets.
+   * The distal joint (wrist/ankle) stays at rest so the end-effector in
+   * the CCD chain (the forearm/shin tip) maps to the actual hand/foot
+   * tip position.
    */
-  reachToward(limb: LimbGrip['limb'], target: Vec3): void {
-    this.ikSubstepCounter++;
-    if (this.ikSubstepCounter % Climber.IK_DECIMATE !== 0) return;
-
+  private runLimbIK(limb: LimbGrip['limb'], target: Vec3, blend: number): void {
     const chainIds = Climber.REACH_CHAINS[limb];
-    const lastJoint = JOINTS.find(j => j.id === chainIds[chainIds.length - 1])!;
     const chain: IKJointSpec[] = chainIds.map(jId => {
       const jd = JOINTS.find(j => j.id === jId)!;
       return {
@@ -597,15 +640,25 @@ export class Climber {
       const err = Quat.mul(restInv, raw, new Quat());
       const clamped = clampRelativeToLimits(err, jd.swingX, jd.swingZ, jd.twistMin, jd.twistMax);
       const final = Quat.mul(restRel, clamped, new Quat()).normalize();
-      // Slerp toward the new IK pose target instead of snapping.
-      const current = this.poseTargets.get(jId) ?? restRel;
-      this.poseTargets.set(jId, slerp(current, final, Climber.IK_TARGET_BLEND));
+      if (blend >= 1) {
+        this.poseTargets.set(jId, final);
+      } else {
+        const current = this.poseTargets.get(jId) ?? restRel;
+        this.poseTargets.set(jId, slerp(current, final, blend));
+      }
     }
-    // Distal joint stays in rest pose so the hand/foot follows the forearm/shin.
-    this.resetJointTarget(lastJoint.id === 'L_elbow_j' ? 'L_wrist_j'
-                       : lastJoint.id === 'R_elbow_j' ? 'R_wrist_j'
-                       : lastJoint.id === 'L_knee_j' ? 'L_ankle_j'
-                       : 'R_ankle_j');
+    this.resetJointTarget(Climber.DISTAL_JOINT[limb]);
+  }
+
+  /**
+   * One IK pass biasing an actively-reaching limb toward `target`. Called
+   * every physics substep; the CCD solver itself only runs every
+   * IK_DECIMATE substeps to give the pose tracker time to converge.
+   */
+  reachToward(limb: LimbGrip['limb'], target: Vec3): void {
+    this.ikSubstepCounter++;
+    if (this.ikSubstepCounter % Climber.IK_DECIMATE !== 0) return;
+    this.runLimbIK(limb, target, Climber.IK_TARGET_BLEND);
   }
 
   /** Reset all joints in a limb's reach chain to their rest targets. */
@@ -662,5 +715,80 @@ export class Climber {
     const m = tau.length();
     if (m > 250) tau.scale(250 / m);
     pelvis.applyTorque(tau);
+  }
+
+  /**
+   * Gravity-compensation feedforward.
+   *
+   * For each joint (parent → child), compute the torque the joint must
+   * apply on the child to hold the child's entire descendant subtree in
+   * static equilibrium against gravity, then apply it directly. The
+   * reaction (opposite torque) is applied to the parent.
+   *
+   * Math:
+   *   F_grav = M_subtree · g                    // net gravity force on subtree
+   *   r      = CoM_subtree − joint_pivot        // moment arm from joint to CoM
+   *   τ_grav = r × F_grav                       // torque gravity creates
+   *                                             //   about the joint pivot
+   *   τ_ff   = −τ_grav                          // torque the joint must apply
+   *                                             //   on the child to cancel it
+   *
+   * Then clamped to the joint's muscle T_max, scaled by fatigue availability
+   * and the lactate strength scale. A fully pumped climber's quads can't
+   * fully support body weight any more — so if a joint can't muster the
+   * gravity-comp torque it needs, the chain sags and pose tracking has to
+   * pick up the slack.
+   */
+  private applyGravityCompensation(lactScale: number): void {
+    const gravity = new Vec3(0, -9.81, 0);
+    // Reused temporaries:
+    const pivot = new Vec3();
+    const com = new Vec3();
+    const r = new Vec3();
+    const F = new Vec3();
+    const tau = new Vec3();
+
+    for (const j of JOINTS) {
+      const parent = this.bodies.get(j.parent)!;
+      const child = this.bodies.get(j.child)!;
+
+      // Joint pivot in world (using parent's anchor; at rest the child
+      // anchor coincides, and near-rest the two are close enough that
+      // either works for a feedforward estimate).
+      parent.localToWorld(new Vec3(...j.localAnchorParent), pivot);
+
+      // Subtree total mass and centre-of-mass in world frame.
+      const descendants = this.jointDescendants.get(j.id)!;
+      let mSub = 0;
+      com.set(0, 0, 0);
+      for (const id of descendants) {
+        const body = this.bodies.get(id);
+        if (!body || body.mass <= 0) continue;
+        com.addScaled(body.position, body.mass);
+        mSub += body.mass;
+      }
+      if (mSub <= 0) continue;
+      com.scale(1 / mSub);
+
+      // τ_grav = r × F_grav, where F_grav = M_sub · g (world-space, negative Y).
+      r.copy(com).sub(pivot);
+      F.copy(gravity).scale(mSub);
+      Vec3.cross(r, F, tau);
+      // Compensating torque on child = −τ_grav.
+      tau.negate();
+
+      // Cap at muscle T_max · availability. When the climber is pumped or
+      // the joint region is weak, gravity comp saturates and the joint
+      // starts to sag — a realistic behaviour.
+      const tmax = REGION_TMAX[j.muscleRegion];
+      const fat = this.fatigue.get(j.muscleRegion)!;
+      const availability = Math.max(0, Math.min(1, fat.M_R + fat.M_A)) * lactScale;
+      const cap = tmax * availability;
+      const mag = tau.length();
+      if (mag > cap && cap > 0) tau.scale(cap / mag);
+
+      child.applyTorque(tau);
+      parent.applyTorque(tau.clone().negate());
+    }
   }
 }
